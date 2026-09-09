@@ -8,9 +8,10 @@ const units_per_pixel: i32 = 1 << subpixel_bits;
 
 const panel_width: usize = 256;
 const height: usize = 144;
-const width: usize = panel_width * 2 + 1;
+const width: usize = panel_width * 4 + 3;
 const frame_count: usize = 48;
 const edge_samples: i32 = 8;
+const trig_scale: i32 = 4096;
 
 const Color = struct {
     r: u8,
@@ -20,7 +21,63 @@ const Color = struct {
 
 const background = Color{ .r = 18, .g = 22, .b = 35 };
 const sword_color = Color{ .r = 106, .g = 215, .b = 255 };
+const hilt_color = Color{ .r = 255, .g = 184, .b = 77 };
 const divider_color = Color{ .r = 68, .g = 78, .b = 105 };
+
+const ResolveMode = enum {
+    alpha_coverage,
+    ordered_dither,
+    palette_ramp,
+};
+
+// Bayer ranks distribute partial coverage into a stable 4 x 4 pattern.
+// This lets an edge use only its existing two palette colors.
+const bayer_4x4 = [4][4]u8{
+    .{ 0, 8, 2, 10 },
+    .{ 12, 4, 14, 6 },
+    .{ 3, 11, 1, 9 },
+    .{ 15, 7, 13, 5 },
+};
+
+// An artist-controlled blue ramp. These are ordinary opaque palette entries,
+// not colors blended by the renderer at runtime.
+const sword_coverage_ramp = [_]Color{
+    .{ .r = 31, .g = 70, .b = 98 },
+    .{ .r = 43, .g = 101, .b = 138 },
+    .{ .r = 57, .g = 132, .b = 176 },
+    .{ .r = 72, .g = 162, .b = 207 },
+    .{ .r = 89, .g = 190, .b = 233 },
+    sword_color,
+};
+
+const BladeTransform = struct {
+    x: i32,
+    y: i32,
+    cos: i32,
+    sin: i32,
+};
+
+// Q12 fixed-point cos/sin samples for a 30-to-60-degree swing, in two-degree
+// steps. No float values participate in rendering or animation.
+const swing_vectors = [_]struct { cos: i32, sin: i32 }{
+    .{ .cos = 3547, .sin = 2048 }, // 30 degrees
+    .{ .cos = 3474, .sin = 2171 },
+    .{ .cos = 3395, .sin = 2291 },
+    .{ .cos = 3313, .sin = 2408 },
+    .{ .cos = 3227, .sin = 2522 },
+    .{ .cos = 3138, .sin = 2634 },
+    .{ .cos = 3044, .sin = 2740 },
+    .{ .cos = 2947, .sin = 2846 },
+    .{ .cos = 2896, .sin = 2896 }, // 45 degrees
+    .{ .cos = 2846, .sin = 2947 },
+    .{ .cos = 2740, .sin = 3044 },
+    .{ .cos = 2634, .sin = 3138 },
+    .{ .cos = 2522, .sin = 3227 },
+    .{ .cos = 2408, .sin = 3313 },
+    .{ .cos = 2291, .sin = 3395 },
+    .{ .cos = 2171, .sin = 3474 },
+    .{ .cos = 2048, .sin = 3547 }, // 60 degrees
+};
 
 const Framebuffer = struct {
     pixels: [width * height]Color = undefined,
@@ -38,14 +95,9 @@ fn abs(value: i32) i32 {
     return if (value < 0) -value else value;
 }
 
-fn clamp(value: i32, low: i32, high: i32) i32 {
-    return @max(low, @min(value, high));
-}
-
 fn mix(background_color: Color, foreground_color: Color, coverage: i32) Color {
-    // coverage is 0..edge_samples^2. This is intentionally palette-free so
-    // the coverage transition is obvious. A pixel-art renderer could instead
-    // use a hand-authored palette or a dither pattern at this point.
+    // coverage is 0..edge_samples^2. This is the deliberately smooth,
+    // palette-expanding comparison mode.
     const total = edge_samples * edge_samples;
     const r = @divTrunc(@as(i32, background_color.r) * (total - coverage) + @as(i32, foreground_color.r) * coverage, total);
     const g = @divTrunc(@as(i32, background_color.g) * (total - coverage) + @as(i32, foreground_color.g) * coverage, total);
@@ -53,16 +105,32 @@ fn mix(background_color: Color, foreground_color: Color, coverage: i32) Color {
     return .{ .r = @intCast(r), .g = @intCast(g), .b = @intCast(b) };
 }
 
-// A 45-degree sword is a rotated rectangle. The u/v transform avoids floats:
-// u = dx + dy and v = dx - dy. Its long diagonal axis is u.
-fn isInsideSword(sample_x: i32, sample_y: i32, sword_x: i32, sword_y: i32) bool {
-    const dx = sample_x - sword_x;
-    const dy = sample_y - sword_y;
-    const along = dx + dy;
-    const across = dx - dy;
+fn isInsideSword(sample_x: i32, sample_y: i32, blade: BladeTransform) bool {
+    // Rotate the point into blade-local coordinates using Q12 lookup values.
+    const dx = sample_x - blade.x;
+    const dy = sample_y - blade.y;
+    const along = @divTrunc(dx * blade.cos + dy * blade.sin, trig_scale);
+    const across = @divTrunc(-dx * blade.sin + dy * blade.cos, trig_scale);
     const half_length = 37 * units_per_pixel;
     const half_width = 3 * units_per_pixel;
     return abs(along) <= half_length and abs(across) <= half_width;
+}
+
+fn bladeForFrame(frame: usize) BladeTransform {
+    const swing_period = swing_vectors.len * 2 - 2;
+    const phase = frame % swing_period;
+    const vector_index = if (phase < swing_vectors.len) phase else swing_period - phase;
+    const vector = swing_vectors[vector_index];
+
+    // 0.34765625 screen pixels per frame: deliberately not an integer rate.
+    const travel_x = @as(i32, @intCast(frame)) * 89;
+    const travel_y = @as(i32, @intCast(frame)) * 31;
+    return .{
+        .x = 70 * units_per_pixel + @mod(travel_x, 110 * units_per_pixel),
+        .y = 54 * units_per_pixel + @mod(travel_y, 38 * units_per_pixel),
+        .cos = vector.cos,
+        .sin = vector.sin,
+    };
 }
 
 fn drawGrid(framebuffer: *Framebuffer, panel_x: usize) void {
@@ -82,24 +150,51 @@ fn drawGrid(framebuffer: *Framebuffer, panel_x: usize) void {
     }
 }
 
-fn drawClassicSword(framebuffer: *Framebuffer, panel_x: usize, sword_x: i32, sword_y: i32) void {
+fn drawClassicSword(framebuffer: *Framebuffer, panel_x: usize, blade: BladeTransform) void {
     // The conventional result: snap the object's transform, then test one
     // sample at each pixel centre.
-    const snapped_x = @divTrunc(sword_x + units_per_pixel / 2, units_per_pixel) * units_per_pixel;
-    const snapped_y = @divTrunc(sword_y + units_per_pixel / 2, units_per_pixel) * units_per_pixel;
+    const snapped_blade = BladeTransform{
+        .x = @divTrunc(blade.x + units_per_pixel / 2, units_per_pixel) * units_per_pixel,
+        .y = @divTrunc(blade.y + units_per_pixel / 2, units_per_pixel) * units_per_pixel,
+        .cos = blade.cos,
+        .sin = blade.sin,
+    };
 
     for (0..height) |y| {
         for (0..panel_width) |local_x| {
             const center_x: i32 = @as(i32, @intCast(local_x)) * units_per_pixel + units_per_pixel / 2;
             const center_y: i32 = @as(i32, @intCast(y)) * units_per_pixel + units_per_pixel / 2;
-            if (isInsideSword(center_x, center_y, snapped_x, snapped_y)) {
+            if (isInsideSword(center_x, center_y, snapped_blade)) {
                 framebuffer.set(panel_x + local_x, y, sword_color);
             }
         }
     }
 }
 
-fn drawAdaptiveSword(framebuffer: *Framebuffer, panel_x: usize, sword_x: i32, sword_y: i32) void {
+fn drawCrispHilt(framebuffer: *Framebuffer, panel_x: usize, blade: BladeTransform) void {
+    // Per-object resolution budget: the hilt remains a deliberately crisp
+    // sprite, even while its attached blade resolves fractional movement.
+    const center_x = @divTrunc(blade.x + units_per_pixel / 2, units_per_pixel);
+    const center_y = @divTrunc(blade.y + units_per_pixel / 2, units_per_pixel);
+    const sprite = [5][5]bool{
+        .{ false, false, true, false, false },
+        .{ true, true, true, true, true },
+        .{ false, false, true, false, false },
+        .{ false, false, true, false, false },
+        .{ false, true, true, true, false },
+    };
+
+    for (sprite, 0..) |row, sprite_y| {
+        for (row, 0..) |filled, sprite_x| {
+            if (!filled) continue;
+            const x = center_x - 2 + @as(i32, @intCast(sprite_x));
+            const y = center_y - 2 + @as(i32, @intCast(sprite_y));
+            framebuffer.set(panel_x + @as(usize, @intCast(x)), @intCast(y), hilt_color);
+        }
+    }
+}
+
+fn drawAdaptiveSword(framebuffer: *Framebuffer, panel_x: usize, blade: BladeTransform, mode: ResolveMode) void {
     // Most pixels do no micro-sampling. Only pixels that have mixed corner
     // coverage, or lie in the sword's small conservative bounding box, are
     // refined with an 8 x 8 sample grid. The bounding-box rule matters for a
@@ -114,13 +209,13 @@ fn drawAdaptiveSword(framebuffer: *Framebuffer, panel_x: usize, sword_x: i32, sw
             const x1 = x0 + units_per_pixel - 1;
             const y1 = y0 + units_per_pixel - 1;
 
-            if (x1 < sword_x - bounding_radius or x0 > sword_x + bounding_radius or y1 < sword_y - bounding_radius or y0 > sword_y + bounding_radius) continue;
+            if (x1 < blade.x - bounding_radius or x0 > blade.x + bounding_radius or y1 < blade.y - bounding_radius or y0 > blade.y + bounding_radius) continue;
 
             const corners = [_]bool{
-                isInsideSword(x0, y0, sword_x, sword_y),
-                isInsideSword(x1, y0, sword_x, sword_y),
-                isInsideSword(x0, y1, sword_x, sword_y),
-                isInsideSword(x1, y1, sword_x, sword_y),
+                isInsideSword(x0, y0, blade),
+                isInsideSword(x1, y0, blade),
+                isInsideSword(x0, y1, blade),
+                isInsideSword(x1, y1, blade),
             };
             const inside_count: usize = @as(usize, @intFromBool(corners[0])) + @as(usize, @intFromBool(corners[1])) + @as(usize, @intFromBool(corners[2])) + @as(usize, @intFromBool(corners[3]));
 
@@ -134,14 +229,36 @@ fn drawAdaptiveSword(framebuffer: *Framebuffer, panel_x: usize, sword_x: i32, sw
                 for (0..edge_samples) |sample_x| {
                     const sx = x0 + @as(i32, @intCast(sample_x)) * sample_step + sample_center;
                     const sy = y0 + @as(i32, @intCast(sample_y)) * sample_step + sample_center;
-                    if (isInsideSword(sx, sy, sword_x, sword_y)) covered += 1;
+                    if (isInsideSword(sx, sy, blade)) covered += 1;
                 }
             }
-            // Composite over what is already in the framebuffer. Using the
-            // constant background here would erase the grid for zero-coverage
-            // candidate pixels, producing a visible opaque bounding square.
-            const destination = framebuffer.pixels[y * width + panel_x + local_x];
-            framebuffer.set(panel_x + local_x, y, mix(destination, sword_color, covered));
+            switch (mode) {
+                .alpha_coverage => {
+                    // Composite over what is already in the framebuffer.
+                    // Using a constant background here would erase the grid
+                    // for zero-coverage pixels, producing an opaque square.
+                    const destination = framebuffer.pixels[y * width + panel_x + local_x];
+                    framebuffer.set(panel_x + local_x, y, mix(destination, sword_color, covered));
+                },
+                .ordered_dither => {
+                    // Convert continuous coverage back into a binary palette
+                    // choice. The 4 x 4 threshold pattern is screen-locked,
+                    // so it reads as intentional pixel texture rather than a
+                    // newly invented anti-aliased edge color.
+                    const rank = bayer_4x4[y % 4][local_x % 4];
+                    const threshold: i32 = @as(i32, rank) * 4 + 2;
+                    if (covered > threshold) framebuffer.set(panel_x + local_x, y, sword_color);
+                },
+                .palette_ramp => {
+                    // Quantize coverage into a small, hand-selected color
+                    // ramp. Unlike spatial dithering, every edge pixel has a
+                    // stable color: no checker pattern and no invented RGB.
+                    if (covered == 0) continue;
+                    const total = edge_samples * edge_samples;
+                    const index: usize = @intCast(@divTrunc(covered * @as(i32, sword_coverage_ramp.len) - 1, total));
+                    framebuffer.set(panel_x + local_x, y, sword_coverage_ramp[index]);
+                },
+            }
         }
     }
 }
@@ -206,20 +323,23 @@ pub fn main(init: std.process.Init) !void {
         framebuffer.clear(background);
         drawGrid(&framebuffer, 0);
         drawGrid(&framebuffer, panel_width + 1);
+        drawGrid(&framebuffer, panel_width * 2 + 2);
+        drawGrid(&framebuffer, panel_width * 3 + 3);
 
-        // 0.34765625 screen pixels per frame: this is deliberately not an
-        // integer motion rate, so snapping causes visible temporal jumps.
-        const travel_x = @as(i32, @intCast(frame)) * 89;
-        const travel_y = @as(i32, @intCast(frame)) * 31;
-        const sword_x = 70 * units_per_pixel + @mod(travel_x, 110 * units_per_pixel);
-        const sword_y = 54 * units_per_pixel + @mod(travel_y, 38 * units_per_pixel);
+        const blade = bladeForFrame(frame);
 
-        drawClassicSword(&framebuffer, 0, sword_x, sword_y);
+        drawClassicSword(&framebuffer, 0, blade);
         for (0..height) |y| framebuffer.set(panel_width, y, divider_color);
-        drawAdaptiveSword(&framebuffer, panel_width + 1, sword_x, sword_y);
+        drawAdaptiveSword(&framebuffer, panel_width + 1, blade, .alpha_coverage);
+        for (0..height) |y| framebuffer.set(panel_width * 2 + 1, y, divider_color);
+        drawAdaptiveSword(&framebuffer, panel_width * 2 + 2, blade, .ordered_dither);
+        for (0..height) |y| framebuffer.set(panel_width * 3 + 2, y, divider_color);
+        drawAdaptiveSword(&framebuffer, panel_width * 3 + 3, blade, .palette_ramp);
+        const panel_origins = [_]usize{ 0, panel_width + 1, panel_width * 2 + 2, panel_width * 3 + 3 };
+        for (panel_origins) |panel_x| drawCrispHilt(&framebuffer, panel_x, blade);
         try writeBmp(init.io, &framebuffer, frame);
     }
 
     std.debug.print("Wrote {d} comparison frames to out/.\n", .{frame_count});
-    std.debug.print("Left: snapped one-sample rendering. Right: fixed-point adaptive coverage.\n", .{});
+    std.debug.print("Panels: snapped, alpha coverage, ordered dither, and palette-ramp coverage.\n", .{});
 }
